@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from ..data.knowledge_graph import MemoryGraph
+from ..retriever.hybrid_retriever import VectorIndex
+
+# How many nodes to pull from VectorIndex when building filtered subgraphs —
+# must match FILTERED_TOP_N in graph_router.py so training and inference see
+# exactly the same node selection process.
+_FILTERED_TOP_N = 50
 
 
 # Templates for generating natural language queries from graph paths
@@ -36,14 +42,21 @@ QUERY_TEMPLATES_2HOP = [
 def generate_read_training_data(
     graph: MemoryGraph,
     user_id: str,
+    vector_index: VectorIndex | None = None,
+    filtered_top_n: int = _FILTERED_TOP_N,
 ) -> list[dict[str, Any]]:
     """
     Generate (query, graph_schema, expected_path, answer) training examples
     from the current state of a user's knowledge graph.
 
+    When *vector_index* is supplied the schema injected into each training
+    example is a query-specific filtered subgraph, matching exactly what
+    GraphRouter injects at inference time (tier-2 / tier-3 routing). This
+    eliminates the train-inference distribution mismatch identified in P1.
+
     Returns list of training examples in chat format ready for LoRA fine-tuning.
     """
-    graph_schema = graph.get_schema_text(user_id)
+    graph_schema_full = graph.get_schema_text(user_id)  # fallback when vector index is empty
     retrieval_examples = graph.generate_retrieval_examples(user_id)
 
     training_pairs = []
@@ -72,6 +85,24 @@ def generate_read_training_data(
             rel2=rel2,
             source=source_content[:50],
         )
+
+        # Build filtered schema matching what GraphRouter injects at inference time.
+        # Using a per-query vector search ensures training examples reflect the
+        # partial-information setting the LoRA will face at runtime (P1 fix).
+        if vector_index is not None:
+            vector_hits = vector_index.search(
+                query=query,
+                user_id=user_id,
+                n_results=filtered_top_n,
+            )
+            node_ids = [h["id"] for h in vector_hits]
+            graph_schema = (
+                graph.get_filtered_schema_text(user_id, node_ids)
+                if node_ids
+                else graph_schema_full
+            )
+        else:
+            graph_schema = graph_schema_full
 
         # Build the expected output
         expected_output = {

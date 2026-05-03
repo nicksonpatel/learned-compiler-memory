@@ -160,7 +160,7 @@ class MemoryPipeline:
         """Return the full structured memory store."""
         return self.retriever.get_all()
 
-    def _format_log(self, turns: list[Turn]) -> str:
+    def _format_log(self, turns: list[RawTurn]) -> str:
         lines = []
         for i, turn in enumerate(turns, 1):
             lines.append(f"Turn {i} [{turn.role}]: {turn.content}")

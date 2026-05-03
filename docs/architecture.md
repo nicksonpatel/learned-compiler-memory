@@ -110,7 +110,7 @@ Static model, no improvement        Read LoRA trained on write-head output
 
 | Method | Description |
 |---|---|
-| `MemoryPipeline.create(user_id, ...)` | Factory. Wires up EventLog, MemoryStore, MCMInference, VectorIndex, MemoryGraph, ConsolidationWorker. |
+| `MemoryPipeline.create(user_id, ...)` | Factory. Instantiates EventLog, MemoryStore, VectorIndex, HybridRetriever, MCMInference, MemoryGraph, and ConsolidationWorker. Accepts `event_db`, `memory_db`, `chroma_dir`, and `consolidation_config` keyword arguments. |
 | `add_turn(role, content, session_id)` | Appends a RawTurn to the EventLog. <1ms. No LLM. |
 | `consolidate_async()` | Fires the background consolidation worker (non-blocking). |
 | `consolidate_sync()` | Blocks until consolidation for this user is complete (for tests/CLI). |
@@ -303,6 +303,8 @@ Parameters (`GraphRouter.__init__`):
 **File:** `src/memory_model/read_training_generator.py`  
 **Role:** Buffers (query, graph, path) training pairs produced by each consolidation cycle, writes train/val JSONL splits when the threshold is reached.
 
+Each training example is built from a **query-filtered subgraph** — the same top-N nodes selected by vector similarity that `GraphRouter` injects at inference time. This ensures the training distribution matches the inference distribution exactly, eliminating the train-inference mismatch that would occur if full graph schemas were used during training. The filtering is done by `generate_read_training_data(graph, user_id, vector_index)` inside `ConsolidationWorker`, which passes the live `VectorIndex` so that each example's schema reflects what the LoRA will actually see at runtime.
+
 ---
 
 ## 5. Storage Layer Architecture
@@ -416,8 +418,8 @@ mcm.consolidate(raw_log_text)           ← ONE LLM call for the whole batch
    │       │
    │       └── knowledge_graph.add_edge()     resolves content snippets → unit IDs
    │
-   ├─► generate_read_training_data(graph, user_id)
-   │       │
+   ├─► generate_read_training_data(graph, user_id, vector_index)
+   │       │   (filtered subgraph per query — matches GraphRouter inference exactly)
    │       └── read_training_accumulator.add_examples()
    │
    ├─► knowledge_graph.save()
@@ -596,6 +598,7 @@ At threshold (default 500 examples):
 The feedback loop:
 - The more turns the agent processes → the richer the graph → the more training examples → the better the read head
 - The better the read head → the more accurately it routes complex multi-hop queries → the more useful the agent memory context
+- Training examples use query-filtered subgraphs (via the live `VectorIndex`), not full graph schemas. This matches the partial-information setting the LoRA will face at inference time, ensuring no train-inference distribution mismatch.
 
 No human labelling is required after the initial write-head synthetic data generation.
 
@@ -693,13 +696,11 @@ from src.agent.memory_pipeline import MemoryPipeline
 
 pipeline = MemoryPipeline.create(
     user_id="user-123",
-    mcm_model_path="Qwen/Qwen2.5-1.5B-Instruct",       # no adapters = base model
-    write_adapter_path="models/mcm_write",               # optional, defaults to base
-    read_adapter_path="models/mcm_read",                 # optional, defaults to base
-    event_log_path="data/events.db",
-    memory_db_path="data/memory.db",
-    chromadb_path="data/.chromadb",
-    graph_path="data/memory_graph.json",
+    mcm_model_path="Qwen/Qwen2.5-1.5B-Instruct",  # path to base model or adapter directory
+    event_db="data/events.db",                       # optional, default shown
+    memory_db="data/memory.db",                      # optional, default shown
+    chroma_dir="data/.chromadb",                     # optional, default shown
+    # consolidation_config=ConsolidationConfig(...)   # optional, tune thresholds here
 )
 
 # On every agent turn:

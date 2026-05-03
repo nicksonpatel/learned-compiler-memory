@@ -116,8 +116,10 @@ class ConsolidationWorker:
         # Write graph edges from MCM output
         self._write_graph_edges(user_id, mcm_output, unit_ids)
 
-        # Generate retrieval training data from the updated graph
-        read_examples = generate_read_training_data(self.knowledge_graph, user_id)
+        # Generate retrieval training data from the updated graph.
+        # Pass the vector_index so each example uses a query-filtered subgraph,
+        # matching exactly what GraphRouter injects at inference time (P1 fix).
+        read_examples = generate_read_training_data(self.knowledge_graph, user_id, self.vector_index)
         self._read_training.add_examples(read_examples)
 
         # Persist graph

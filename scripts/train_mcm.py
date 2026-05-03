@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import inspect
 from pathlib import Path
 
 from datasets import load_dataset
@@ -31,13 +32,29 @@ from trl import SFTTrainer
 
 import torch
 
+# --- Detect TRL API at runtime so the script works across all TRL versions ---
+try:
+    from trl import SFTConfig
+    _sft_cfg_params = set(inspect.signature(SFTConfig.__init__).parameters)
+    USE_SFT_CONFIG = True
+    MAX_SEQ_KWARG = "max_seq_length" if "max_seq_length" in _sft_cfg_params else "max_length"
+    print(f"[API] SFTConfig detected, seq_len kwarg='{MAX_SEQ_KWARG}'")
+except ImportError:
+    USE_SFT_CONFIG = False
+    print("[API] SFTConfig not found, using TrainingArguments")
 
-def load_model_and_tokenizer(model_name: str):
+_trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters)
+USE_PROCESSING_CLASS = "processing_class" in _trainer_params
+print(f"[API] SFTTrainer tokenizer arg: {'processing_class' if USE_PROCESSING_CLASS else 'tokenizer'}")
+# ---
+
+
+def load_model_and_tokenizer(model_name: str, use_fp16: bool = False):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16 if use_fp16 else torch.bfloat16,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -50,7 +67,7 @@ def load_model_and_tokenizer(model_name: str):
         device_map="auto",
         trust_remote_code=True,
     )
-    model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     return model, tokenizer
 
 
@@ -70,14 +87,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--head", type=str, choices=["write", "read"], default="write",
                         help="Which head to train: 'write' for consolidation, 'read' for retrieval routing")
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--data_dir", type=str, default="data/synthetic")
     parser.add_argument("--output_dir", type=str, default="checkpoints/mcm-write-v1")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--per_device_batch_size", type=int, default=4)
     parser.add_argument("--grad_accumulation_steps", type=int, default=8)
-    parser.add_argument("--max_seq_length", type=int, default=4096)
+    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--save_steps", type=int, default=300,
+                        help="Save checkpoint every N steps (~1 hr on RTX4090; tune per GPU)")
+    parser.add_argument("--save_total_limit", type=int, default=10,
+                        help="Max checkpoints to keep (10 × ~1 hr = ~10 hrs of history)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a previous checkpoint to resume from")
     args = parser.parse_args()
 
     # Read head uses shorter sequences (query + graph schema, not full logs)
@@ -94,45 +117,81 @@ def main():
         },
     )
 
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+    print(f"GPU dtype: {'bf16' if use_bf16 else 'fp16' if use_fp16 else 'cpu'}")
+
     # Load model
     print(f"Loading {args.base_model}...")
-    model, tokenizer = load_model_and_tokenizer(args.base_model)
+    model, tokenizer = load_model_and_tokenizer(args.base_model, use_fp16=use_fp16)
     model = build_peft_model(model)
     model.print_trainable_parameters()
 
-    # Training args
-    training_args = TrainingArguments(
+    # Formatting function: apply the model's chat template to the `messages` field.
+    def formatting_func(examples):
+        return [
+            tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            for msgs in examples["messages"]
+        ]
+
+    common_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.per_device_batch_size,
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accumulation_steps,
+        gradient_checkpointing=True,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         warmup_ratio=0.05,
-        bf16=True,
+        bf16=use_bf16,
+        fp16=use_fp16,
         logging_steps=10,
-        evaluation_strategy="steps",
-        eval_steps=100,
+        eval_steps=200,
         save_strategy="steps",
-        save_steps=200,
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        report_to="wandb",
-        run_name=f"mcm-{args.head}-v1",
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        load_best_model_at_end=False,
+        report_to="none",
     )
 
-    # Train
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"],
-        args=training_args,
-        max_seq_length=args.max_seq_length,
-    )
+    if USE_SFT_CONFIG:
+        def apply_template(examples):
+            return {"text": [
+                tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+                for msgs in examples["messages"]
+            ]}
+        dataset = dataset.map(apply_template, batched=True, remove_columns=["messages"])
+        training_args = SFTConfig(
+            **common_kwargs,
+            dataset_text_field="text",
+            eval_strategy="steps",
+            **{MAX_SEQ_KWARG: args.max_seq_length},
+        )
+        trainer_kwargs = dict(
+            model=model,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["validation"],
+            args=training_args,
+        )
+    else:
+        training_args = TrainingArguments(**common_kwargs, eval_strategy="steps")
+        trainer_kwargs = dict(
+            model=model,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["validation"],
+            args=training_args,
+            formatting_func=formatting_func,
+            max_seq_length=args.max_seq_length,
+        )
+
+    tok_key = "processing_class" if USE_PROCESSING_CLASS else "tokenizer"
+    trainer_kwargs[tok_key] = tokenizer
+
+    trainer = SFTTrainer(**trainer_kwargs)
 
     print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
     print(f"Model saved to {args.output_dir}")
 

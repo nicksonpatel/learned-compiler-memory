@@ -1,0 +1,35 @@
+# Model checkpoints — large binary files, do not push to GitHub
+checkpoints/
+
+# Training data — can be regenerated; some files are 100MB+
+data/
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment variables / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Results (large output files — add selectively if you want to track them)
+results/

@@ -100,7 +100,7 @@ class MCMInference:
     # WRITE HEAD: raw log → structured memory + graph edges + retrieval training
     # ------------------------------------------------------------------
 
-    def consolidate(self, interaction_log: str, max_new_tokens: int = 3072) -> dict[str, Any]:
+    def consolidate(self, interaction_log: str, max_new_tokens: int = 6144) -> dict[str, Any]:
         """
         Write head: transform raw interaction log into:
           - memory_units: structured JSON (same schema as before)
@@ -121,7 +121,7 @@ class MCMInference:
         )
 
     # Backward compat alias
-    def generate(self, interaction_log: str, max_new_tokens: int = 2048) -> dict:
+    def generate(self, interaction_log: str, max_new_tokens: int = 6144) -> dict:
         return self.consolidate(interaction_log, max_new_tokens)
 
     # ------------------------------------------------------------------
@@ -189,11 +189,16 @@ class MCMInference:
             {"role": "user", "content": user_content},
         ]
 
-        input_ids = self.tokenizer.apply_chat_template(
+        inputs = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             return_tensors="pt",
-        ).to(model.device)
+        )
+        # Newer transformers returns BatchEncoding; older returns a raw tensor
+        if hasattr(inputs, "input_ids"):
+            input_ids = inputs["input_ids"].to(model.device)
+        else:
+            input_ids = inputs.to(model.device)
 
         with torch.no_grad():
             output_ids = model.generate(
@@ -207,13 +212,35 @@ class MCMInference:
         generated = output_ids[0][input_ids.shape[1]:]
         raw_output = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
+        # Debug: print first 300 chars of raw output to diagnose JSON failures
+        import os
+        if os.environ.get("MCM_DEBUG"):
+            print(f"[MCM_DEBUG] raw_output[:300]: {raw_output[:300]!r}")
+
+        # Try strict parse first
         try:
             return json.loads(raw_output)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw_output, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
-            return {}
+            pass
+
+        # LLM output is often truncated mid-JSON — use json-repair to recover it
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(raw_output, return_objects=True)
+            if isinstance(repaired, dict) and repaired:
+                return repaired
+        except ImportError:
+            pass
+
+        # Last resort: find largest valid JSON object substring
+        start = raw_output.find("{")
+        end = raw_output.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw_output[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        if os.environ.get("MCM_DEBUG"):
+            print(f"[MCM_DEBUG] JSON parse failed entirely, output length={len(raw_output)}")
+        return {}
