@@ -17,6 +17,23 @@ Quick reference for paper writing. For each system, note what they do and how MC
 
 ---
 
+## Learned / RL-Trained Memory Management (2025–2026)
+
+Newer than the systems above, and closer to what MCM is actually doing: instead of a large LLM prompted to manage memory, these train a dedicated policy for memory operations. Mostly via RL rather than SFT — this is the category MCM most needs to differentiate against.
+
+| System | Method | Relation to MCM |
+|---|---|---|
+| **Memory-R1** (Yan et al., 2025) — arXiv:2508.19828 | RL (PPO/GRPO)-trained Memory Manager (ADD/UPDATE/DELETE/NOOP) + Answer Agent; reward = downstream QA correctness | Same write/read split intuition as MCM's dual-head design, but the policy is RL-trained end-to-end on outcome reward, not SFT-distilled from a teacher on synthetic (log→memory) pairs |
+| **Mem-α** (2025) — arXiv:2509.25911 | RL for learning memory *construction* directly | Targets the same job as MCM's write head; worth comparing SFT-then-freeze (MCM) vs. RL fine-tune (Mem-α) for write-head quality |
+| **LightMem** (Fang et al., ICLR 2026) — arXiv:2510.18866 | Three small LMs (Controller / Selector / Writer) for online memory ops; consolidation decoupled from the online path | Closest architectural cousin to MCM — independently validates the "no LLM on the critical path, dedicated small model per stage" design choice |
+| **GraphRAG-Router** (2026) — arXiv:2604.16401 | RL-trained router choosing between GraphRAG and a plain LLM per query, optimizing cost/accuracy | Solves the same problem as MCM's read head (learned routing over graph-structured memory), but via RL against a cost/accuracy reward instead of SFT on self-generated path labels |
+| **MemRouter** (2026) — arXiv:2605.00356 | Memory-as-embedding routing for long-term conversational agents | Alternative read-side design: routes via learned embeddings rather than a graph-traversal LoRA |
+| **Agentic Memory** (2026) — arXiv:2601.01885 | Unified long-term/short-term memory management with learned prioritization and forgetting | Adjacent capability MCM does not yet have — current design has no learned decay/forgetting mechanism |
+
+**Where MCM differs:** every RL-trained system above needs an environment that can score outcomes (QA correctness, routing cost/accuracy) to train against. MCM instead uses **teacher distillation + a self-generated supervision loop** — the write head (SFT on teacher-labeled log→memory pairs) produces structured memory over time, and that structure is mined for (query, path, answer) triples that train the read head, with no RL infrastructure or reward model required. This is cheaper to bootstrap, but the tradeoff — already flagged in `docs/improvement_plan.md` — is that self-generated, templated supervision may teach path completion rather than true discrimination between plausible paths. That is exactly the failure mode RL-based approaches (Memory-R1, Mem-α, GraphRAG-Router) sidestep by training directly against outcomes. This tension is worth stating explicitly in the paper's related work section, and worth testing empirically: does an RL fine-tuning pass on top of the SFT-warm-started read head close the gap that `improvement_plan.md` identifies?
+
+---
+
 ## Continual Learning / Fine-tuning
 
 | Paper | Key Insight | Relevance |
@@ -64,3 +81,6 @@ Quick reference for paper writing. For each system, note what they do and how MC
 3. LoCoMo benchmark (Maharana et al., 2024) — arXiv:2402.17753
 4. QLoRA (Dettmers et al., 2023) — arXiv:2305.14314
 5. Cognitive Architectures for LLMs (Sumers et al., 2023) — arXiv:2309.02427
+6. Memory-R1 (Yan et al., 2025) — arXiv:2508.19828 — closest competing system; read before writing the paper's related-work/positioning section
+7. LightMem (Fang et al., ICLR 2026) — arXiv:2510.18866 — closest architectural cousin (small models, decoupled online/offline path)
+8. Mem-α (2025) — arXiv:2509.25911 — RL alternative to MCM's SFT write head; relevant to the read-head training-mismatch problem in `docs/improvement_plan.md`
